@@ -10,7 +10,7 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 const rooms = {};
 
-// Пинг-понг для поддержания соединения (heartbeat)
+// Heartbeat для стабильности Render
 setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.readyState === WebSocket.OPEN) {
@@ -30,7 +30,7 @@ wss.on('connection', (ws) => {
       // 1. Подключение к комнате
       if (data.type === 'join_room') {
         currentRoom = data.roomId || 'default';
-        playerRole = data.role || 'player1';
+        playerRole = data.role || data.playerRole || 'player1';
 
         if (!rooms[currentRoom]) {
           rooms[currentRoom] = {
@@ -43,7 +43,7 @@ wss.on('connection', (ws) => {
         rooms[currentRoom].clients.push(ws);
         rooms[currentRoom].players[playerRole] = data.player || { role: playerRole };
 
-        console.log(`[+] Игрок вошел в комнату "${currentRoom}" как ${playerRole}`);
+        console.log(`[+] Игрок подключился к "${currentRoom}" как ${playerRole}`);
 
         ws.send(JSON.stringify({
           type: 'room_joined',
@@ -52,37 +52,40 @@ wss.on('connection', (ws) => {
         }));
       }
 
-      // 2. Игрок отправил действие
+      // 2. Игрок отправил ход
       if (data.type === 'coop_action' || data.type === 'submit_action') {
         const room = rooms[currentRoom];
         if (!room) return;
 
-        const actionText = data.cleanActionText || data.actionText || data.action || 'Осмотреться вокруг';
-        room.pendingActions[playerRole] = actionText;
-        console.log(`[Ход] ${playerRole}: ${actionText}`);
+        const role = data.playerRole || data.role || playerRole || 'player1';
+        const actionText = data.action || data.cleanActionText || data.actionText || 'Осмотреться вокруг';
 
-        // Сразу подтверждаем ход, чтобы игра сняла таймаут ожидания
+        room.pendingActions[role] = actionText;
+        console.log(`[Ход] ${role}: ${actionText}`);
+
+        // Оповещаем о принятии действия
         room.clients.forEach(client => {
           if (client.readyState === WebSocket.OPEN) {
             client.send(JSON.stringify({
               type: 'action_acknowledged',
-              role: playerRole
+              role: role
             }));
             client.send(JSON.stringify({
               type: 'generating',
-              status: 'Нейросеть генерирует ход...'
+              status: 'Нейросеть описывает происходящее...'
             }));
           }
         });
 
-        const actions = Object.entries(room.pendingActions);
         const prompt = `
-Ты гейммастер текстовой ролевой игры "Сверхъестественное" (Supernatural RPG). Октябрь 2005 года. 
-Локация: Гараж / Окраина города.
-Действие игрока: "${actionText}".
+Ты гейммастер ролевой игры "Сверхъестественное" (Supernatural RPG).
+Сеттинг: Октябрь 2005 года, город Черный Ручей.
+Персонаж: Виктор Крейвен.
+Локация: ${data.location || 'Гараж'}.
+Действие персонажа: "${actionText}".
 
-Опиши кинематографично и атмосферно последствия этого действия. Что произошло вокруг? Какие зацепки или детали заметил Виктор?
-Пиши живым языком на русском в стиле мистического триллера, 2-3 абзаца.
+Опиши кинематографично и атмосферно последствия этого действия. Что произошло вокруг? Что персонаж заметил или нашел?
+Пиши на русском языке, в стиле мистического детектива, 2-3 коротких плотных абзаца.
         `;
 
         try {
@@ -91,45 +94,46 @@ wss.on('connection', (ws) => {
             contents: prompt
           });
 
-          const narrativeText = response.text || 'Вы внимательно осматриваетесь в полумраке гаража, прислушиваясь к шорохам за стеной...';
+          const narrativeText = response.text || 'Вы внимательно осматриваете полумрак вокруг...';
           room.pendingActions = {};
 
-          // Отправляем пакет, совместимый с разными версиями хука
-          const payload = {
-            type: 'coop_action_result',
+          // Пакет строго по структуре хука useGameNetwork
+          const resolvedPayload = {
+            type: 'round_resolved',
             narrative: narrativeText,
-            storyText: narrativeText,
-            coopRes: {
-              narrative: narrativeText,
-              stateUpdates: {}
-            }
+            stateUpdates: {},
+            apiUsage: { promptTokens: 0, responseTokens: 0 }
           };
 
           room.clients.forEach(client => {
             if (client.readyState === WebSocket.OPEN) {
-              client.send(JSON.stringify(payload));
-              // Дополнительный дубль для совместимости с submitCoopAction
+              client.send(JSON.stringify(resolvedPayload));
+              
+              // Дублируем и одиночный тип на случай ветвления
               client.send(JSON.stringify({
-                type: 'action_result',
-                ...payload
+                ...resolvedPayload,
+                type: 'action_resolved'
               }));
             }
           });
-          console.log(`[OK] Ответ от Gemini успешно отправлен игроку!`);
+
+          console.log(`[OK] Сюжет отправлен клиенту (${role})`);
         } catch (err) {
           console.error('Ошибка вызова Gemini:', err);
           room.clients.forEach(client => {
             if (client.readyState === WebSocket.OPEN) {
               client.send(JSON.stringify({
-                type: 'action_result',
-                coopRes: { narrative: 'Тени сгущаются, но пока ничего не происходит...' }
+                type: 'round_resolved',
+                narrative: 'Шорох в темноте отвлек внимание, подробности ускользают. Попробуйте еще раз.',
+                stateUpdates: {},
+                apiUsage: {}
               }));
             }
           });
         }
       }
     } catch (e) {
-      console.error('Ошибка парсинга JSON:', e);
+      console.error('Ошибка обработки JSON:', e);
     }
   });
 
@@ -137,7 +141,7 @@ wss.on('connection', (ws) => {
     if (currentRoom && rooms[currentRoom]) {
       rooms[currentRoom].clients = rooms[currentRoom].clients.filter(c => c !== ws);
       delete rooms[currentRoom].players[playerRole];
-      console.log(`[-] Игрок ${playerRole} покинул комнату ${currentRoom}`);
+      console.log(`[-] Игрок ${playerRole} отключился`);
     }
   });
 });
