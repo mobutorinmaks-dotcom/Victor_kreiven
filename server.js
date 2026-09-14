@@ -79,7 +79,7 @@ ${actions.map(([r, act]) => `- ${r}: "${act}"`).join('\n')}
         try {
           // Используем стабильную рабочую модель
           const response = await ai.models.generateContent({
-            model: 'gemini-2.0-flash',
+            model: 'gemini-3.5-flash-lite',
             contents: prompt
           });
 
