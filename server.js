@@ -4,7 +4,7 @@ import { GoogleGenAI } from '@google/genai';
 
 dotenv.config();
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 const wss = new WebSocketServer({ port: PORT });
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
@@ -21,7 +21,7 @@ wss.on('connection', (ws) => {
       // 1. Подключение к комнате
       if (data.type === 'join_room') {
         currentRoom = data.roomId || 'default';
-        playerRole = data.role || 'player';
+        playerRole = data.role || 'player1';
 
         if (!rooms[currentRoom]) {
           rooms[currentRoom] = {
@@ -32,7 +32,7 @@ wss.on('connection', (ws) => {
         }
 
         rooms[currentRoom].clients.push(ws);
-        rooms[currentRoom].players[playerRole] = data.player;
+        rooms[currentRoom].players[playerRole] = data.player || { role: playerRole };
 
         console.log(`[+] Игрок вошел в комнату "${currentRoom}" как ${playerRole}`);
 
@@ -48,62 +48,68 @@ wss.on('connection', (ws) => {
         const room = rooms[currentRoom];
         if (!room) return;
 
-        room.pendingActions[playerRole] = data.actionText;
-        console.log(`[Ход] ${playerRole}: ${data.actionText}`);
+        // Извлекаем текст действия из любого поля клиента
+        const actionText = data.cleanActionText || data.actionText || data.action || 'Осмотреться вокруг';
+        room.pendingActions[playerRole] = actionText;
+        console.log(`[Ход] ${playerRole}: ${actionText}`);
 
-        // Оповещаем о получении действия
+        // Оповещаем о принятии действия
         room.clients.forEach(client => {
           if (client.readyState === WebSocket.OPEN) {
             client.send(JSON.stringify({
               type: 'action_acknowledged',
               role: playerRole
             }));
+            client.send(JSON.stringify({
+              type: 'generating',
+              status: 'Нейросеть обрабатывает последствия...'
+            }));
           }
         });
 
-        // Запуск генерации (если действие получено)
         const actions = Object.entries(room.pendingActions);
-        if (actions.length >= 1) { // Срабатывает от действия игрока
+        const prompt = `
+Сеттинг: Мистический детектив, октябрь 2005 года. Город Черный Ручей.
+Действия персонажа:
+${actions.map(([r, act]) => `- ${r}: "${act}"`).join('\n')}
+
+Опиши кинематографично и атмосферно последствия этих действий. Что произошло вокруг? Что персонаж видит дальше? Сделай ответ живым, в стиле мистического триллера на русском языке. Объем: 2-3 абзаца.
+        `;
+
+        try {
+          // Используем стабильную рабочую модель
+          const response = await ai.models.generateContent({
+            model: 'gemini-2.0-flash',
+            contents: prompt
+          });
+
+          const narrativeText = response.text || 'События вокруг развиваются своим чередом...';
+          room.pendingActions = {};
+
+          // Рассылаем ответ клиенту игры
           room.clients.forEach(client => {
             if (client.readyState === WebSocket.OPEN) {
               client.send(JSON.stringify({
-                type: 'generating',
-                status: 'Нейросеть обрабатывает последствия...'
+                type: 'action_result',
+                coopRes: {
+                  narrative: narrativeText
+                }
               }));
             }
           });
-
-          const prompt = `
-Сеттинг: Мистический детектив, октябрь 2005 года.
-Действия персонажей:
-${actions.map(([r, act]) => `- ${r}: "${act}"`).join('\n')}
-
-Опиши кинематографично и атмосферно последствия этих действий. Что произошло вокруг? Что персонажи видят дальше? Сделай ответ живым, в стиле мистического триллера на русском языке.
-          `;
-
-          try {
-            const response = await ai.models.generateContent({
-              model: 'gemini-2.5-flash',
-              contents: prompt
-            });
-
-            const narrativeText = response.text;
-            room.pendingActions = {}; // сброс раунда
-
-            // Рассылаем ответ всем в комнате
-            room.clients.forEach(client => {
-              if (client.readyState === WebSocket.OPEN) {
-                client.send(JSON.stringify({
-                  type: 'action_result',
-                  coopRes: {
-                    narrative: narrativeText
-                  }
-                }));
-              }
-            });
-          } catch (err) {
-            console.error('Ошибка Gemini:', err);
-          }
+        } catch (err) {
+          console.error('Ошибка Gemini:', err);
+          // Отправляем fallback-сообщение в чат вместо разрыва связи
+          room.clients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(JSON.stringify({
+                type: 'action_result',
+                coopRes: {
+                  narrative: 'В темноте что-то шевельнулось, но детали рассмотреть не удалось. Попробуйте повторить действие.'
+                }
+              }));
+            }
+          });
         }
       }
     } catch (e) {
