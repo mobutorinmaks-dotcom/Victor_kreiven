@@ -10,6 +10,15 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 const rooms = {};
 
+// Пинг-понг для поддержания соединения (heartbeat)
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.ping();
+    }
+  });
+}, 25000);
+
 wss.on('connection', (ws) => {
   let currentRoom = null;
   let playerRole = null;
@@ -44,16 +53,15 @@ wss.on('connection', (ws) => {
       }
 
       // 2. Игрок отправил действие
-      if (data.type === 'coop_action') {
+      if (data.type === 'coop_action' || data.type === 'submit_action') {
         const room = rooms[currentRoom];
         if (!room) return;
 
-        // Извлекаем текст действия из любого поля клиента
         const actionText = data.cleanActionText || data.actionText || data.action || 'Осмотреться вокруг';
         room.pendingActions[playerRole] = actionText;
         console.log(`[Ход] ${playerRole}: ${actionText}`);
 
-        // Оповещаем о принятии действия
+        // Сразу подтверждаем ход, чтобы игра сняла таймаут ожидания
         room.clients.forEach(client => {
           if (client.readyState === WebSocket.OPEN) {
             client.send(JSON.stringify({
@@ -62,58 +70,66 @@ wss.on('connection', (ws) => {
             }));
             client.send(JSON.stringify({
               type: 'generating',
-              status: 'Нейросеть обрабатывает последствия...'
+              status: 'Нейросеть генерирует ход...'
             }));
           }
         });
 
         const actions = Object.entries(room.pendingActions);
         const prompt = `
-Сеттинг: Мистический детектив, октябрь 2005 года. Город Черный Ручей.
-Действия персонажа:
-${actions.map(([r, act]) => `- ${r}: "${act}"`).join('\n')}
+Ты гейммастер текстовой ролевой игры "Сверхъестественное" (Supernatural RPG). Октябрь 2005 года. 
+Локация: Гараж / Окраина города.
+Действие игрока: "${actionText}".
 
-Опиши кинематографично и атмосферно последствия этих действий. Что произошло вокруг? Что персонаж видит дальше? Сделай ответ живым, в стиле мистического триллера на русском языке. Объем: 2-3 абзаца.
+Опиши кинематографично и атмосферно последствия этого действия. Что произошло вокруг? Какие зацепки или детали заметил Виктор?
+Пиши живым языком на русском в стиле мистического триллера, 2-3 абзаца.
         `;
 
         try {
-          // Используем стабильную рабочую модель
           const response = await ai.models.generateContent({
             model: 'gemini-3.5-flash-lite',
             contents: prompt
           });
 
-          const narrativeText = response.text || 'События вокруг развиваются своим чередом...';
+          const narrativeText = response.text || 'Вы внимательно осматриваетесь в полумраке гаража, прислушиваясь к шорохам за стеной...';
           room.pendingActions = {};
 
-          // Рассылаем ответ клиенту игры
+          // Отправляем пакет, совместимый с разными версиями хука
+          const payload = {
+            type: 'coop_action_result',
+            narrative: narrativeText,
+            storyText: narrativeText,
+            coopRes: {
+              narrative: narrativeText,
+              stateUpdates: {}
+            }
+          };
+
           room.clients.forEach(client => {
             if (client.readyState === WebSocket.OPEN) {
+              client.send(JSON.stringify(payload));
+              // Дополнительный дубль для совместимости с submitCoopAction
               client.send(JSON.stringify({
                 type: 'action_result',
-                coopRes: {
-                  narrative: narrativeText
-                }
+                ...payload
               }));
             }
           });
+          console.log(`[OK] Ответ от Gemini успешно отправлен игроку!`);
         } catch (err) {
-          console.error('Ошибка Gemini:', err);
-          // Отправляем fallback-сообщение в чат вместо разрыва связи
+          console.error('Ошибка вызова Gemini:', err);
           room.clients.forEach(client => {
             if (client.readyState === WebSocket.OPEN) {
               client.send(JSON.stringify({
                 type: 'action_result',
-                coopRes: {
-                  narrative: 'В темноте что-то шевельнулось, но детали рассмотреть не удалось. Попробуйте повторить действие.'
-                }
+                coopRes: { narrative: 'Тени сгущаются, но пока ничего не происходит...' }
               }));
             }
           });
         }
       }
     } catch (e) {
-      console.error('Ошибка обработки пакета:', e);
+      console.error('Ошибка парсинга JSON:', e);
     }
   });
 
